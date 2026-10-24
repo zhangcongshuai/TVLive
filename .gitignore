@@ -1,0 +1,13 @@
+# 构建产物
+build/
+
+# 本地签名密钥（build.sh 首次运行会自动生成，不要提交）
+tools/demo.jks
+
+# 未对齐/未签名的中间文件
+*.idsig
+*.class
+
+# 系统垃圾
+.DS_Store
+Thumbs.db
