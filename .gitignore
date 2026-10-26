@@ -1,8 +1,15 @@
 # 构建产物
 build/
+app/build/
+.gradle/
 
-# 本地签名密钥（build.sh 首次运行会自动生成，不要提交）
-tools/demo.jks
+# Gradle 本地配置（含本机 SDK 路径）
+local.properties
+
+# 本地签名密钥
+# 注意：v2 起故意提交 tools/demo.jks —— 这样任何人编译出来的 APK 签名一致，
+# 覆盖升级不会冲突。只够自己装机用，要上架请换成自己的 keystore。
+# tools/demo.jks
 
 # 未对齐/未签名的中间文件
 *.idsig

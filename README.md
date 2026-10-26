@@ -1,245 +1,239 @@
 # 极简电视 · TVLive
 
-> 一个只有三个按键的电视直播 App：**打开就是台，上下键换台，OK 键挑台**。
-> 给不太会用智能电视的老人用。37 KB，零第三方依赖，Android 5.0+，遥控器操作。
-
-[![Release](https://img.shields.io/github/v/release/zhangcongshuai/TVLive?color=2F6BFF&label=release)](https://github.com/zhangcongshuai/TVLive/releases)
-[![License](https://img.shields.io/github/license/zhangcongshuai/TVLive?color=green)](LICENSE)
-[![Platform](https://img.shields.io/badge/Android-5.0%2B%20(TV%2F%E7%9B%92%E5%AD%90)-3DDC84)](https://developer.android.com)
-[![Size](https://img.shields.io/badge/APK-37%20KB-orange)](https://github.com/zhangcongshuai/TVLive/releases)
+> 打开就是台，上下键换台，OK 键挑台。给不太会用智能电视的老人用。
+> Android 5.0+，遥控器操作，零广告零弹窗。
 
 <p align="center">
   <img src="docs/screenshots/playing.jpg" width="46%" alt="播放界面">
   <img src="docs/screenshots/channels.jpg" width="46%" alt="频道列表">
 </p>
 
-## 为什么做这个
+---
 
-家里老人看电视，卡住的从来不是"没有台"，而是**操作路径太长**：开机广告 → 找到应用 → 记住菜单位置 →
-选分类 → 选频道 → 万一没画面，还得琢磨怎么换源。每一步都要人教，教完下次又忘。
+## v2 修了什么
 
-这个 App 把这一串动作压缩成一个规则：**打开就在播，上下就是换台**。
-其他一概不做——没有切换源界面、没有小窗、没有 EPG、没有设置页。想换台就按 OK 打开列表，
-列表里当前台有黄色 `▶` 标记，还能用数字键直接跳到台号。
+v1 的症状：**每次打开都是同一个片段，播十秒开始转圈，然后就断了。**
 
-## 特性
+排查下来是三个问题叠在一起，不是播放器"不会播"：
 
-| | |
-|---|---|
-| **开机即播** | 启动直接续播上次看的台，记住位置 |
-| **▲ / ▼ 换台** | 到头循环；已经在这个台上时按上下键不会重复重连黑屏 |
-| **OK 弹列表** | 左侧分类（获得焦点即预览该分类），右侧频道，按 OK 播 |
-| **数字键跳台** | 按 `0` `5` → 跳到 005 台，输入后 1.8 秒自动生效 |
-| **一个台多个源** | 播放失败自动换下一个源，信息条显示"换个源试试… 2/3" |
-| **失败不黑屏** | 播不起来时信息条常驻并说明原因，不会让老人对着黑屏猜 |
-| **看门狗** | 15 秒没进 `onPrepared` 就当失败，先换源，全换完再重试 2 次 |
-| **可换源** | 覆盖一个 m3u 文件即可，不用重装 APK |
-| **零依赖** | 37 KB，不用 ExoPlayer / AndroidX / Gradle |
+### 1. 内置源里有大量"伪直播"网关
 
-字号按老人视距调过：台名 30sp、台号 52sp、列表 24sp。
+`tsfile` 那类网关（`223.78.65.165:9901`、`219.159.147.195:9901`）返回的 m3u8 只挂着
+**约 20 秒的缓存分片**，播完就 EOF。用 ffmpeg 拉 60 秒，它只跑到 19.58 秒就自己结束了：
 
-## 下载安装
-
-到 [Releases](https://github.com/zhangcongshuai/TVLive/releases) 下载 `TVLive-1.0.apk`，然后任选一种装法：
-
-```bash
-# 电视开启了 ADB 调试（同一局域网）
-adb connect 192.168.1.x:5555
-adb install -r TVLive-1.0.apk
+```
+$ ffmpeg -i "http://223.78.65.165:9901/tsfile/live/0001_1.m3u8?..." -t 60 -f null -
+frame=471   out_time=00:00:19.580000      # 60 秒的任务，20 秒就 EOF 了
 ```
 
-或者把 APK 拷到 U 盘，插电视上用自带的文件管理器安装。App 会同时出现在普通应用列表和
-Android TV 的 Leanback 启动器里（带 320×180 的 banner 图）。
+**所以"每次打开都是同一个片段"——因为它真的只有这一段。**
+
+### 2. 备用源大面积失效，主源一断就掉进死源
+
+v1 给 CCTV-1 挂了三个源。第一个能播但会断，断了一换，第二个 `219.159.147.195:9901`
+根本连不上（8 秒超时），界面就永远停在"正在打开"。日志：
+
+```
+SocketTimeoutException: failed to connect to /219.159.147.195 (port 9901) after 8000ms
+```
+
+### 3. 系统 MediaPlayer 处理不了 HLS 直播断流
+
+`MediaPlayer` 对 HLS 直播窗口滚动（旧分片被 CDN 删掉）几乎没有恢复能力，断了就是断了。
+而且它分不清直播和点播，一个循环片段播完就在那儿等着。
+
+---
+
+## v2 的做法
+
+### 播放器换成 ExoPlayer（Media3）
+
+不是图新，是因为它能做三件 `MediaPlayer` 做不到的事：
+- HLS 直播窗口滚动时不会崩，能续上
+- 能判断 `isCurrentMediaItemLive()`，分得清直播和点播
+- 断流后能原地重连，不用整个播放器重建
+
+代价是 APK 从 37 KB 变成 3.7 MB。电视盒子上无所谓。
+
+### 三道自愈
+
+| 情况 | 处理 |
+|---|---|
+| 播放中断（网络错误） | **原地重连一次**，不行再换源 |
+| 流结束（`STATE_ENDED`） | **绝不重连**——重连只会再播一遍同一段。直接换源 |
+| 画面卡死（position 3 秒不动） | 连续 4 次判定卡死，换源 |
+| 首帧 12 秒不出来 | 直接换源，不再等第二轮 |
+
+最后一条是这次专门加的。`prepare` 之后如果源"连得上但不出画面"，
+ExoPlayer 的 `onPlayerError` 可能几十秒都不来，界面就一直转圈——v1 的"10 秒后开始加载"
+有一半是这个原因。
+
+### 源健康度
+
+每个源独立记账：连续失败次数、上次成功时间、是否硬判死（403/404）、
+播一会儿就 EOF 的次数。换台时按健康度排序取最好的那个，**上次能播的源下次优先用**。
+
+播一会儿就 EOF 的源会被记 `shortHits`，权重比普通失败重得多——宁可试一个没试过的，
+也不让你再看到同一段。
+
+### 60 秒持续解码实测筛源
+
+这是这次最花时间的部分。**只测"能不能出画"是不够的**，必须测"能连续播多久"。
+
+对 1400 多个候选地址，每个用 ffmpeg 连续解码 60 秒：
+
+- `>= 55s` → stable，首选
+- `20~55s` → short，能出画但中途断，App 会自动重连，当备用
+- `< 20s` → 淘汰（就是那批伪直播源）
+
+### 在线补源
+
+按菜单键可以联网拉订阅，**只给已有的台补源，不新增台**。
+（公共订阅里塞着几万个世界各地的台，全灌进来只会让频道号乱跳、老人找不到 CCTV-1。）
+
+---
+
+## 内置频道（43 个台）
+
+全部经过「60 秒连续解码」+「交付前逐条复核」两道实测：
+
+| 分类 | 台数 | 内容 |
+|---|---|---|
+| 央视频道 | 22 | CCTV-1/2/3/4/5/5+/6/7/8/9/10/11/12/13/14/15/16/17、4K、8K、CGTN 各语种 |
+| 卫视频道 | 16 | 东方、浙江、湖南、广东、河南、河北、安徽、江西、山西、新疆、西藏、内蒙古、黑龙江、东南、康巴、安多 |
+| 港澳台 | 4 | 翡翠台、台视、民视、公视 |
+| 其他 | 1 | 浙江钱江 |
+
+台号按「央视数字序 → 卫视常见序」固定编好，**数字键跳台不会错位**：
+按 `5` 就是 CCTV-5，按 `23` 就是第一个卫视。
+
+> 缺的卫视（北京、江苏、山东、天津、四川、湖北、重庆等）不是没找，是这次实测确实
+> 没找到能连续播满 60 秒的公开源。卫视的版权保护比央视严，公开源更容易被封。
+> 你家的宽带走不同 CDN，**自己补源大概率比我这份更全**——见下面「换源」。
+
+---
+
+## 安装
+
+> **⚠️ 必须先卸载 v1。**
+> v1 的 APK 是用作者本地密钥签的，v2 用了新密钥，签名对不上无法覆盖安装。
+> 卸载会丢掉"上次看到第几台"的记忆，其他没有影响。
+
+```bash
+adb uninstall com.mini.tvlive
+adb install -r TVLive-2.0.apk
+```
+
+或者 U 盘拷到电视上，用自带文件管理器装（先卸载旧的）。
+
+App 会同时出现在普通应用列表和 Android TV 的 Leanback 启动器里。
 
 ## 按键
 
 | 按键 | 行为 |
 |---|---|
 | `▲` / `▼` | 上一个台 / 下一个台（循环） |
-| `OK`（确定） | 弹出频道列表：左右换分类，上下选台，再按 OK 播放 |
+| `OK` | 频道列表：左右换分类，上下选台，再按 OK 播放 |
 | 数字键 | 直接输入台号跳转，如按 `1` `2` → 012 台 |
-| `返回` | 弹出 / 收起频道列表（不会误退出 App） |
+| `返回` | 弹出 / 收起频道列表（不会误退出） |
+| `菜单` | 联网刷新源 |
 
-退出 App 用遥控器的 Home 键——**特意没让返回键能退出**，避免老人误触。
+退出用遥控器 Home 键——**特意没让返回键能退出**，避免老人误触。
 
-## 内置频道
+## 换源
 
-当前内置 **38 个台**，全部是**在这台电视上一台一台播出来**验证过的（不是只测 HTTP 200）：
+启动时按优先级合并三个来源：
 
-| 分类 | 数量 | 内容 |
-|---|---|---|
-| 央视频道 | 18 | CCTV-1/2/3/4/5/5+/6/7/8/9/10/11/12/13/14/15/16/17 全套 |
-| 卫视频道 | 11 | 东方、浙江、湖南、黑龙江、河北、东南、大湾区、广西、延边、内蒙古、人间 |
-| 其他频道 | 9 | CGTN 六种语言、CHC 电影、央视台球、浙江钱江 |
-
-源的原始素材来自 [ngo5/IPTV](https://github.com/ngo5/IPTV) 等公开列表，但**能用哪些完全取决于你家的宽带**
-（移动/电信/联通的 CDN 各不相同，IPv4 / IPv6 可达性也不同）。所以仓库里同时放了：
-
-- `assets/playlist.m3u` —— 内置的 38 台（我这边实测可播）
-- `playlist.full.m3u` —— 当初 65 台的完整候选，另外 27 台在我这条线路上已失效，你那边可能是好的
-
-**换成你自己的源，大概率比用我这份更稳。**
-
-## 换源（不用重装）
-
-App 启动时按这个顺序找列表：
-
-1. `/sdcard/Android/data/com.mini.tvlive/files/playlist.m3u` ← 优先
-2. APK 内置的 `assets/playlist.m3u`
+1. `/sdcard/Android/data/com.mini.tvlive/files/playlist.m3u` ← 你自己的，最优先
+2. App 私有目录的 `cache.m3u` ← 在线更新缓存
+3. APK 内置的 `assets/playlist.m3u` ← 兜底
 
 ```bash
 adb push my.m3u /sdcard/Android/data/com.mini.tvlive/files/playlist.m3u
-adb shell am force-stop com.mini.tvlive    # 重启 App 生效
+adb shell am force-stop com.mini.tvlive    # 重启生效
 ```
 
-格式是标准 M3U，`group-title` 是分类名，逗号后是频道名，下一行是地址：
+格式是标准 M3U。**同名同分组的多条记录 = 同一个台的多个备用源**，按顺序试：
 
 ```m3u
 #EXTM3U
-
 #EXTINF:-1 group-title="央视频道",CCTV-1 综合
 http://example.com/cctv1-a.m3u8
 #EXTINF:-1 group-title="央视频道",CCTV-1 综合
 http://example.com/cctv1-b.m3u8
 ```
 
-**同名同分组的多条记录 = 同一个台的多个备用源**，按顺序试。台号按频道首次出现的顺序自动编号 001、002…
+## 关于源，几句实话
 
-## 维护源：两个调试开关
+公共 IPTV 源是消耗品。这次实测 1400 多个候选地址，**能出画面的不到 15%，
+能连续播满一分钟的更少**。所以：
 
-公共源会失效。仓库里自带两个只在放了标记文件时才启用的调试功能，用来判断"到底哪些台真能出画"。
+- 内置的源是我这边实测能播的，但你家的宽带（移动/电信/联通）走的是不同 CDN，
+  **IPv4/IPv6 可达性也不同**——我这儿能播的，你那儿不一定；反之亦然。
+- 内置列表随时会失效。这不是 App 的问题，是公共源的常态。
+- 按菜单键联网补源，或者用上面「换源」的办法换成你自己的源，**大概率比用我这份更稳**。
 
-### 1. 源自检 `dotest.marker`
-
-后台逐条探测所有地址，结果写到 `probe_result.txt`，每行 `状态码:类型|分组|频道名|地址`：
-
-```bash
-adb shell "echo x > /sdcard/Android/data/com.mini.tvlive/files/dotest.marker"
-adb shell am force-stop com.mini.tvlive
-adb shell am start -n com.mini.tvlive/.MainActivity
-# 等它跑完（2 并发，别开大——公共网关会按 IP 封）
-adb pull /sdcard/Android/data/com.mini.tvlive/files/probe_result.txt
-```
-
-只验证"能不能拉到播放列表"，**不等于能出画面**。要判断真出画，用下面这个。
-
-### 2. 播放日志 `statelog.marker`
-
-每次换台的结果追加到 `state.log`：
-
-```bash
-adb shell "touch /sdcard/Android/data/com.mini.tvlive/files/statelog.marker"
-adb shell am force-stop com.mini.tvlive
-adb shell am start -n com.mini.tvlive/.MainActivity
-adb shell "cat /sdcard/Android/data/com.mini.tvlive/files/state.log"
-```
-
-每行 `PLAY/FAIL/TRY <台号> <台名>`，`PLAY` 表示真的进了 `onPrepared`。不带 marker 时这套逻辑完全不执行。
-
-把这两个开关和一个 adb 按键脚本凑起来，就可以全自动扫描所有频道：
-
-```bash
-for ch in $(seq 1 38); do
-  for d in $(echo $ch | fold -w1); do adb shell input keyevent KEYCODE_$d; done
-  sleep 20
-done
-adb shell "cat /sdcard/Android/data/com.mini.tvlive/files/state.log"
-```
-
-> 踩坑提醒：公共 IPTV 网关（如 `tsfile` 那类）**并发一高就按 IP 临时封禁**，表现为大面积
-> 超时/连接被拒，等十几分钟自己恢复。批量扫描时把并发压到 2，并且注意区分"源挂了"和"我被限流了"——
-> 我曾经有一批央视台在扫描里集体失败、几分钟后单独复测又全部正常。
+> 踩坑记录：批量探测时并发开到 8，公共 CDN 会按 IP 限流，
+> 把一批本来能播的源判成死的（浙江卫视 `ali-m-l.cztv.com` 单独测能出画，批量里却 FAIL）。
+> 复测时把并发压到 3 才准。**如果你自己扫源，别开大并发。**
 
 ## 从源码编译
 
-不需要 Gradle，也不需要 Android Studio，一条命令出包：
+需要 JDK 17、Android SDK（platform 34 + build-tools 34）、Gradle 8.7。
 
 ```bash
-./build.sh
-# 产物：dist/TVLive-1.0.apk
+export JAVA_HOME=/path/to/jdk17
+export ANDROID_HOME=/path/to/android-sdk
+echo "sdk.dir=/path/to/android-sdk" > local.properties
+
+gradle assembleRelease
+# 产物：app/build/outputs/apk/release/app-release.apk
 ```
 
-需要准备：
-
-| 依赖 | 说明 |
-|---|---|
-| JDK 8 | `javac` / `keytool`。build-tools 31+ 的 `d8` 要 JDK 11，所以推荐用 build-tools **30.0.3** |
-| Android SDK build-tools | 提供 `aapt2` / `d8` / `zipalign` / `apksigner` |
-| `android.jar` | 来自 platforms（脚本用 `--target-sdk-version 30` 链接） |
-| Python + Pillow | 只在需要重新生成图标时用到，图标已随仓库提交 |
-
-脚本会自动在 `$ANDROID_HOME` / `$HOME/Library/Android/sdk` 下找工具，也可以用环境变量指定：
-
-```bash
-BUILD_TOOLS=/path/to/build-tools/30.0.3 \
-ANDROID_JAR=/path/to/platforms/android-30/android.jar \
-./build.sh
-```
-
-构建链路（每一步都能单独跑，出问题好定位）：
-
-```
-tools/gen_icons.py → aapt2 compile → aapt2 link (-A assets) → javac → d8 →
-zip classes.dex → zipalign -p 4 → apksigner sign
-```
-
-**签名**：`tools/demo.jks`（口令 `tvlive123`）不存在时脚本会自动生成一个，仅够自己装机用。
-要上架或长期分发请换成自己的 keystore，并注意 keystore 变了以后覆盖安装会失败（需先卸载）。
+签名用的是仓库里的 `tools/demo.jks`（口令 `tvlive123`），**故意提交进仓库**——
+这样任何人编译出来的 APK 签名一致，覆盖升级不会冲突。只够自己装机用，
+要上架请换成自己的 keystore。
 
 ## 代码结构
 
 ```
-src/com/mini/tvlive/
-├── MainActivity.java   播放、信息条、频道面板、按键分发、多源自动切换、看门狗
-├── PlaylistLoader.java m3u 解析（同名同分组归并成多源）+ 外部文件 / 内置 asset 加载
-├── Channel.java        频道模型（台号、名称、分组、备用地址列表、当前源下标）
-└── SelfTest.java       源自检：批量探测 + dump 模式（抓播放列表正文和首个分片）
+app/src/main/java/com/mini/tvlive/
+├── MainActivity.java   播放、信息条、频道面板、按键分发、三道自愈
+├── Channel.java        频道模型 + 每个源的健康度记账
+├── PlaylistLoader.java m3u 解析、多列表合并、分组归一化
+└── SourceStore.java    内置源 + 在线补源 + 健康度持久化
 
-assets/playlist.m3u     内置频道列表
-playlist.full.m3u       65 台完整候选（含已失效的源）
-tools/                  gen_icons.py / make_playlist.py / assemble_from_probe.py
-docs/screenshots/       README 截图
+app/src/main/assets/playlist.m3u   内置频道（实测筛出来的）
+tools/probe*.py                    探测脚本（见下）
 ```
 
-## 设计取舍
+`tools/` 下这套探测脚本是这次调源用的，留着方便下次重新筛：
 
-**为什么用 `MediaPlayer` 而不是 ExoPlayer？**
-包体积 37 KB vs 3 MB+，且不用 AndroidX 那一套依赖。系统解码器对 HLS 的支持在老盒子/电视上
-反而更好（ExoPlayer 的某些版本在某些国产电视上反而要额外配置）。代价是个别 HLS 变体
-（如 MP3 音频轨、slice 损坏的码流）系统解不了——这类台只能换源。
-
-**为什么不用 Gradle？**
-这个项目只有一个 Activity 和三个辅助类，Gradle 的配置成本远大于收益。手写 `aapt2 + javac + d8 +
-apksigner` 一共 6 步，还能看清每一步到底干了什么。缺点是资源不能享受 `R.java` 自动补全——所以
-界面是纯代码布局，没有 XML。
-
-**为什么面板打开时信息条要隐藏？**
-最初两者同时显示，面板是半透明的，信息条会在背后透成一层模糊残影，老人会以为画面坏了。
-现在 `showBar()` 在面板可见时直接返回。
-
-**为什么"打不开"时信息条不自动消失？**
-信息条本来是 4 秒淡出的。但如果压根没播起来，淡出后老人看到的就是纯黑屏，会以为电视坏了。
-所以只有 `playing == true` 才开始倒计时。
-
-**为什么一个 `#EXTINF` 后面可以跟多个地址？**
-标准 M3U 是一对一，但为了让"同一个台多个源"这件事不需要自定义语法，解析器把**连续的地址行**
-都归到上一个频道里。这样既兼容标准 m3u，又能直接把手上的多个源贴在一起。
+```
+parse.py          解析各 m3u → candidates.json（中文台过滤）
+probe.py          第一轮：ffmpeg 解码 6 秒，筛掉出不了画的
+probe_long.py     第二轮：连续解码 60 秒，区分 stable / short / dead
+targeted_probe.py 定向复测：对要的台低并发重测，含 URL 变体（去端口/换协议）
+build_final.py    按稳定性分级生成最终 playlist
+```
 
 ## 已知限制
 
-- 没有回看、时移、EPG、收藏、小窗、切换源界面——**故意的，越少越好**。
-- 一个台最多挂 3 个源，全挂就换台或改 m3u。
-- 只用系统解码器，个别码流（MP3 音轨、切片损坏、HEVC 的某些 profile）解不了。
-- 公共源随时可能失效，这是 IPTV 公共源的常态，不是 App 的问题。
-- 只在 Android 9 的电视盒子上实测过；Android 5–14 理论上都能跑，未逐一验证。
+- 没有回看、时移、EPG、收藏、小窗——**故意的，越少越好**。
+- 一个台最多挂 4 个源。
+- 只用系统解码器（ExoPlayer 也是走 MediaCodec），个别码流（MP3 音轨、
+  损坏的切片、某些 HEVC profile）解不了。
+- 卫视的可用源明显比央视少——卫视版权保护更严，公开源更容易被封。
+- 只在 Android 11 模拟器和 Android 9 盒子上验证过，5–14 理论上都能跑。
 
 ## 免责声明
 
-本项目仅用于**学习 Android TV 开发**（遥控器按键分发、SurfaceView 播放、焦点导航、m3u 解析）。
+本项目仅用于**学习 Android TV 开发**（遥控器按键分发、SurfaceView 播放、
+焦点导航、m3u 解析、HLS 直播容错）。
 
-仓库内不含任何音视频内容，也不提供、不推荐任何具体的直播源；内置列表只是公开网络上已有地址的
-一份快照，随时可能失效。**实际播放内容完全由使用者自己提供的 m3u 决定**，请使用自己有权访问的源，
-并遵守当地法律法规与内容服务条款。
+仓库内不含任何音视频内容，也不提供、不推荐任何具体的直播源；内置列表只是
+公开网络上已有地址的一份快照，随时可能失效。**实际播放内容完全由使用者自己
+提供的 m3u 决定**，请使用自己有权访问的源，并遵守当地法律法规与内容服务条款。
 
 ## License
 
